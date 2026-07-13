@@ -368,6 +368,184 @@ function update_message!(
     return bmps_cache
 end
 
+# ---------------------------------------------------------------------------------------------
+# Biorthogonal one-site update (two independent messages, no symmetry assumed).
+#
+# On an interpartition `pe` the two directed rails are R = {message(e)} (the message being solved)
+# and L = {message(reverse(e))} (the OPPOSING message, held fixed as the bra). Rather than the
+# Euclidean fit (which keeps L = dag(R) and truncates in R's own metric), we solve the local
+# stationarity condition of the BP scalar Z = ∏ vertex_scalar / ∏ edge_scalar in the metric set by
+# L. The one-site update rule for the k-th R tensor is
+#
+#     A_k = (G^L_k)⁺ · b_k · (G^R_k)⁺
+#
+#   • b_k  = `updated_message` at src(e_k): the target O·R_prev contracted against L on every site
+#            but k. It lives in L's virtual-bond basis and — because R messages are outgoing, never
+#            incoming — it does NOT depend on the R rail, so all b_k are fixed once L and the
+#            perpendicular environment are built.
+#   • G^L_k = cumulative R–L bond overlap over sites 1..k-1, G^R_k over sites k+1..n. Their
+#            pseudo-inverses rotate b_k out of L's bond basis into R's, which is where the χ-sized
+#            (non-Hermitian) pinv enters. When L = dag(R) with R canonical the Grams are identity
+#            and this reduces to the Euclidean one-site fit.
+default_normalize(alg::Algorithm"biorthogonal") = true
+function set_default_kwargs(alg::Algorithm"biorthogonal", bmps_cache::BoundaryMPSCache)
+    normalize = get(alg.kwargs, :normalize, default_normalize(alg))
+    tolerance = get(alg.kwargs, :tolerance, default_tolerance(bmps_cache))
+    niters = get(alg.kwargs, :niters, _default_boundarymps_update_niters)
+    cutoff = get(alg.kwargs, :cutoff, 1.0e-12)
+    damping = get(alg.kwargs, :damping, 0.0)   # 0 = full update; >0 under-relaxes each site tensor
+    gauge = get(alg.kwargs, :gauge, false)     # true = center-moving canonicalization; false = bare top→bottom sweep
+    return Algorithm("biorthogonal"; tolerance, niters, normalize, cutoff, damping, gauge)
+end
+
+# Cumulative R–L overlap (transfer fold) over the sites `rng` of interpartition `es`. The result
+# carries the R and L virtual bonds dangling at the boundary of the folded region.
+function _rl_overlap(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge}, rng)
+    G = ITensor(one(Bool))
+    for j in rng
+        G = (G * message(bmps_cache, es[j])) * message(bmps_cache, reverse(es[j]))
+    end
+    return G
+end
+
+# R and L virtual bonds shared between sites `k` and `k+1` of interpartition `es`.
+function _shared_bond(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge}, k::Integer, rail::Bool)
+    ea, eb = rail ? (es[k], es[k + 1]) : (reverse(es[k]), reverse(es[k + 1]))
+    return only(commoninds(message(bmps_cache, ea), message(bmps_cache, eb)))
+end
+
+# Per-bond biorthonormal gauge on the R rail (L held fixed, so a pure gauge: physical R, Z and the
+# fixed targets b_k are unchanged). `M` is the R–L overlap dangling on bond `k`; we gauge R's bond so
+# that overlap becomes an identity map. `from_left = true` folds the residual into site k+1 (used to
+# extend left-canonical form rightward); `from_left = false` folds it into site k (right-canonical,
+# leftward). Because X = M⁺ and its inverse M multiply back to 𝟙 on the bond, the rail is preserved.
+function _gauge_bond_R!(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge}, k::Integer, M::ITensor, from_left::Bool; cutoff)
+    rbond, lbond = _shared_bond(bmps_cache, es, k, true), _shared_bond(bmps_cache, es, k, false)
+    rnew = sim(lbond)
+    X = replaceind(pinv_itensor(M, [rbond], [lbond]; cutoff), lbond, rnew)  # rbond -> rnew
+    Xinv = replaceind(M, lbond, rnew)                                       # X⁻¹, folds rbond back
+    keep, push = from_left ? (k, k + 1) : (k + 1, k)
+    setmessage!(bmps_cache, es[keep], message(bmps_cache, es[keep]) * X)
+    setmessage!(bmps_cache, es[push], Xinv * message(bmps_cache, es[push]))
+    return bmps_cache
+end
+
+# Right-canonicalize the whole R rail w.r.t. L: every right-cumulative overlap (sites k+1..n) becomes
+# an identity map, so the biorthogonal update at any site sees `G^R = 𝟙`. Sweep right to left.
+function right_canonicalize_R!(bmps_cache::BoundaryMPSCache, pe::QuotientEdge; cutoff)
+    es = sorted_edges(bmps_cache, pe)
+    n = length(es)
+    for k in (n - 1):-1:1
+        _gauge_bond_R!(bmps_cache, es, k, _rl_overlap(bmps_cache, es, (k + 1):n), false; cutoff)
+    end
+    return bmps_cache
+end
+
+# Rotate the L-basis target `bk` into R's bond basis via the pseudo-inverted bond Grams.
+function biorthogonal_site(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge}, k::Integer, bk::ITensor; cutoff)
+    n = length(es)
+    Ak = bk
+    if k > 1
+        rbond, lbond = _shared_bond(bmps_cache, es, k - 1, true), _shared_bond(bmps_cache, es, k - 1, false)
+        GLinv = pinv_itensor(_rl_overlap(bmps_cache, es, 1:(k - 1)), [rbond], [lbond]; cutoff)
+        Ak = Ak * GLinv     # bk carries `lbond`; contracting it out leaves `rbond`
+    end
+    if k < n
+        rbond, lbond = _shared_bond(bmps_cache, es, k, true), _shared_bond(bmps_cache, es, k, false)
+        GRinv = pinv_itensor(_rl_overlap(bmps_cache, es, (k + 1):n), [rbond], [lbond]; cutoff)
+        Ak = Ak * GRinv
+    end
+    return Ak
+end
+
+# Build the perpendicular (intra-partition) environment for `src(pe)` in both directions and read
+# off the fixed one-site targets b_k for every crossing edge. Environment + targets depend only on
+# L and the previous-interpartition R message, so they are computed once per message update.
+function _biorthogonal_targets(bmps_cache::BoundaryMPSCache, pe::QuotientEdge)
+    es = sorted_edges(bmps_cache, pe)
+    g = partition_graph(bmps_cache, src(pe))
+    delete_partition_messages!(bmps_cache, src(pe))
+    for v in leaf_vertices(g)
+        update_partition!(bmps_cache, post_order_dfs_edges(g, v))
+    end
+    contract_alg = set_default_kwargs(Algorithm("contract"; normalize = false), bmps_cache)
+    targets = ITensor[]
+    for e in es
+        m, (cache_key, sequence, seq_changed) = updated_message(contract_alg, bmps_cache, e)
+        seq_changed && set!(contraction_sequences(bmps_cache), cache_key, sequence)
+        push!(targets, m)
+    end
+    return targets
+end
+
+function update_message!(
+        alg::Algorithm"biorthogonal", bmps_cache::BoundaryMPSCache, pe::QuotientEdge
+    )
+    es = sorted_edges(bmps_cache, pe)
+    n = length(es)
+    targets = _biorthogonal_targets(bmps_cache, pe)
+
+    cutoff, damping, gauge = alg.kwargs.cutoff, alg.kwargs.damping, alg.kwargs.gauge
+    prev_cf = 0.0
+    for _ in 1:alg.kwargs.niters
+        # One MPS updated top→bottom, one tensor at a time (Gauss–Seidel Petrov–Galerkin projection
+        # of the target O·R_prev with L as test space). With `gauge`, interleave a center-moving
+        # biorthonormal canonicalization so the bond Grams stay ~𝟙; without it, a bare sweep.
+        gauge && right_canonicalize_R!(bmps_cache, pe; cutoff)
+        cf = 0.0
+        for k in 1:n
+            Ak = biorthogonal_site(bmps_cache, es, k, targets[k]; cutoff)
+            alg.kwargs.normalize && (Ak = _normalize(Ak))
+            # Under-relax this MPS component: blend with the current tensor (same bond basis at this
+            # point in the sweep) to tame the non-contractive outer R↔L iteration.
+            if !iszero(damping)
+                Ak = (1 - damping) * Ak + damping * _normalize(message(bmps_cache, es[k]))
+                alg.kwargs.normalize && (Ak = _normalize(Ak))
+            end
+            cf += norm(Ak)
+            setmessage!(bmps_cache, es[k], Ak)
+            gauge && k < n && _gauge_bond_R!(bmps_cache, es, k, _rl_overlap(bmps_cache, es, 1:k), true; cutoff)
+        end
+        cf /= n
+        epsilon = abs(cf - prev_cf)
+        !isnothing(alg.kwargs.tolerance) && epsilon < alg.kwargs.tolerance && break
+        prev_cf = cf
+    end
+    delete_partition_messages!(bmps_cache, src(pe))
+    return bmps_cache
+end
+
+_normalize(m::ITensor) = (n = norm(m); iszero(n) ? m : m / n)
+
+# Outer biorthogonal boundary-MPS iteration with a Z (partition-function) convergence monitor:
+# BP-sweep the interpartition messages one pass at a time and stop when the relative change in Z
+# drops below `tolerance` (or after `maxiter` sweeps). `damping` under-relaxes each site update to
+# tame the non-contractive R↔L dynamics. Returns the converged cache.
+function converge_biorthogonal(
+        bmps_cache::BoundaryMPSCache; damping = 0.0, cutoff = 1.0e-12, gauge = false,
+        maxiter = 100, tolerance = 1.0e-10, verbose = false,
+    )
+    prevZ = nothing
+    for i in 1:maxiter
+        bmps_cache = update(
+            bmps_cache; message_update_alg = Algorithm("biorthogonal"; damping, cutoff, gauge),
+            maxiter = 1, tolerance = nothing,
+        )
+        Z = partitionfunction(bmps_cache)
+        if prevZ !== nothing
+            Δ = abs(Z - prevZ) / abs(Z)
+            verbose && println("  [biorth] sweep $i  Z=$(Z)  ΔZ/Z=$(Δ)")
+            if Δ ≤ tolerance
+                verbose && println("  [biorth] Z converged in $i sweeps")
+                return bmps_cache
+            end
+        end
+        prevZ = Z
+    end
+    verbose && @warn "biorthogonal boundary MPS: Z not converged to $tolerance in $maxiter sweeps"
+    return bmps_cache
+end
+
 function prev_quotientedge(bmps_cache::BoundaryMPSCache, pe::QuotientEdge)
     g = quotient_graph(supergraph(bmps_cache))
     vns = neighbors(g, parent(src(pe)))

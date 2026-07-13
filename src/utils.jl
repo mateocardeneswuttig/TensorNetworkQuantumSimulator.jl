@@ -25,6 +25,21 @@ function pseudo_sqrt_inv_sqrt(M::ITensor; cutoff = 10 * eps(real(scalartype(M)))
     return M_sqrt, M_inv_sqrt
 end
 
+# Moore–Penrose pseudo-inverse of a matrix-like ITensor across the (linds | rinds) split.
+# `M` maps the `linds` space to the `rinds` space; the returned tensor is the inverse map,
+# carrying the same indices but acting `rinds -> linds` (so `M⁺ * M ≈ 𝟙` on `rinds`).
+# Singular values below `cutoff * σ_max` are dropped (handles the non-Hermitian, possibly
+# rank-deficient bond-overlap matrices of the biorthogonal boundary-MPS update).
+function pinv_itensor(M::ITensor, linds, rinds; cutoff = 1.0e-12)
+    U, S, V = ITensors.svd(M, linds)
+    u, v = commonind(U, S), commonind(V, S)
+    σs = [abs(S[u => i, v => i]) for i in 1:dim(u)]
+    σmax = isempty(σs) ? zero(eltype(σs)) : maximum(σs)
+    Sinv = ITensors.map_diag(x -> abs(x) ≤ cutoff * σmax ? zero(x) : inv(x), S)
+    # M = U S V†  ⇒  M⁺ = V S⁻¹ U†
+    return dag(V) * Sinv * dag(U)
+end
+
 #TODO: Make this work for non-hermitian A
 function eigendecomp(A::ITensor, linds, rinds; ishermitian = false, kwargs...)
     @assert ishermitian
