@@ -441,6 +441,30 @@ function right_canonicalize_R!(bmps_cache::BoundaryMPSCache, pe::QuotientEdge; c
     return bmps_cache
 end
 
+# EUCLIDEAN (QR) gauge on the R rail: canonicalize the message on `e1` (make it an isometry over its
+# non-shared indices) and fold the residual into its neighbour on `e2`. Uses only R via a QR — it is
+# positive-definite and never singular, unlike the biorthonormal gauge which inverts the indefinite
+# `⟨R|L⟩`. This is a PURE gauge (physical R, Z, and the fixed targets are unchanged); it just keeps
+# R's bond basis orthonormal so the `⟨R|L⟩` Grams stay well-conditioned for the site-update pinv.
+function _qr_gauge_R!(bmps_cache::BoundaryMPSCache, e1::NamedEdge, e2::NamedEdge)
+    m1, m2 = message(bmps_cache, e1), message(bmps_cache, e2)
+    @assert !isempty(commoninds(m1, m2))
+    q, Y = factorize(m1, uniqueinds(m1, m2); ortho = "left")
+    setmessage!(bmps_cache, e1, q)
+    setmessage!(bmps_cache, e2, m2 * Y)
+    return bmps_cache
+end
+
+# Right-canonicalize the R rail in the Euclidean sense (isometries over crossing + right bond),
+# sweeping right to left. Cheap, stable QR sweep; keeps the Grams bounded.
+function euclidean_right_canonicalize_R!(bmps_cache::BoundaryMPSCache, pe::QuotientEdge)
+    es = sorted_edges(bmps_cache, pe)
+    for k in length(es):-1:2
+        _qr_gauge_R!(bmps_cache, es[k], es[k - 1])
+    end
+    return bmps_cache
+end
+
 # Rotate the L-basis target `bk` into R's bond basis via the pseudo-inverted bond Grams.
 function biorthogonal_site(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge}, k::Integer, bk::ITensor; cutoff)
     n = length(es)
@@ -490,8 +514,9 @@ function update_message!(
     for _ in 1:alg.kwargs.niters
         # One MPS updated top→bottom, one tensor at a time (Gauss–Seidel Petrov–Galerkin projection
         # of the target O·R_prev with L as test space). With `gauge`, interleave a center-moving
-        # biorthonormal canonicalization so the bond Grams stay ~𝟙; without it, a bare sweep.
-        gauge && right_canonicalize_R!(bmps_cache, pe; cutoff)
+        # EUCLIDEAN (QR) canonicalization so R's bond basis stays orthonormal and the ⟨R|L⟩ Grams
+        # stay well-conditioned for the site-update pinv; without it, a bare sweep.
+        gauge && euclidean_right_canonicalize_R!(bmps_cache, pe)
         cf = 0.0
         for k in 1:n
             Ak = biorthogonal_site(bmps_cache, es, k, targets[k]; cutoff)
@@ -504,7 +529,7 @@ function update_message!(
             end
             cf += norm(Ak)
             setmessage!(bmps_cache, es[k], Ak)
-            gauge && k < n && _gauge_bond_R!(bmps_cache, es, k, _rl_overlap(bmps_cache, es, 1:k), true; cutoff)
+            gauge && k < n && _qr_gauge_R!(bmps_cache, es[k], es[k + 1])
         end
         cf /= n
         epsilon = abs(cf - prev_cf)
@@ -517,19 +542,41 @@ end
 
 _normalize(m::ITensor) = (n = norm(m); iszero(n) ? m : m / n)
 
-# Outer biorthogonal boundary-MPS iteration with a Z (partition-function) convergence monitor:
-# BP-sweep the interpartition messages one pass at a time and stop when the relative change in Z
-# drops below `tolerance` (or after `maxiter` sweeps). `damping` under-relaxes each site update to
-# tame the non-contractive R↔L dynamics. Returns the converged cache.
+# Ordered interpartition sweep for a line quotient graph: update every message left→right then
+# right→left, one directed message at a time. This ordering means each message `i→i+1` is built from
+# an already-updated upstream neighbour `i-1→i`, then stays fixed until a neighbouring MPS is
+# revisited — the standard boundary-MPS sweep, which is far more stable than a `forest_cover` order.
+function interpartition_sweep_sequence(bmps_cache::BoundaryMPSCache)
+    p = parent.(sort(collect(quotientvertices(bmps_cache)); by = parent))
+    fwd = [QuotientEdge(p[i] => p[i + 1]) for i in 1:(length(p) - 1)]
+    bwd = [QuotientEdge(p[i + 1] => p[i]) for i in (length(p) - 1):-1:1]
+    return vcat(fwd, bwd)
+end
+
+# Outer biorthogonal boundary-MPS iteration with a Z (partition-function) convergence monitor. Each
+# outer step is ONE ordered sweep over the interpartitions (`interpartition_sweep_sequence`) with a
+# single top→bottom pass per message (`niters = 1`); iterate until the relative change in Z drops
+# below `tolerance` (or `maxiter` sweeps).
+#
+# NOTE ON CONVERGENCE: the two-message map intrinsically drives the rails toward orthogonality (the
+# edge overlaps ⟨R|L⟩ — Z's denominators — collapse and Z diverges), so `damping` is load-bearing:
+# it under-relaxes each site update and bounds the divergence into an oscillation about the true
+# value. `gauge` (Euclidean canonicalization) keeps the ⟨R|L⟩ Grams well-conditioned for the pinv.
+# The bounded iteration typically OSCILLATES rather than settling (and the oscillation is not
+# stationary), so tighten `tolerance`/`maxiter` with care — at state χ ≳ 3 expect ~fitting-level
+# accuracy at best. (Attempts at a stationary fixed point — biorthonormal gauge, DIIS/Anderson — were
+# defeated by the same divergence + per-sweep gauge drift; see git history.)
 function converge_biorthogonal(
-        bmps_cache::BoundaryMPSCache; damping = 0.0, cutoff = 1.0e-12, gauge = false,
+        bmps_cache::BoundaryMPSCache; damping = 0.8, cutoff = 1.0e-12, gauge = true,
         maxiter = 100, tolerance = 1.0e-10, verbose = false,
     )
+    edge_sequence = interpartition_sweep_sequence(bmps_cache)
     prevZ = nothing
     for i in 1:maxiter
         bmps_cache = update(
-            bmps_cache; message_update_alg = Algorithm("biorthogonal"; damping, cutoff, gauge),
-            maxiter = 1, tolerance = nothing,
+            bmps_cache;
+            message_update_alg = Algorithm("biorthogonal"; damping, cutoff, gauge, niters = 1),
+            edge_sequence, maxiter = 1, tolerance = nothing,
         )
         Z = partitionfunction(bmps_cache)
         if prevZ !== nothing
@@ -542,7 +589,7 @@ function converge_biorthogonal(
         end
         prevZ = Z
     end
-    verbose && @warn "biorthogonal boundary MPS: Z not converged to $tolerance in $maxiter sweeps"
+    verbose && @warn "biorthogonal boundary MPS: Z not converged to $tolerance in $maxiter sweeps (oscillating)"
     return bmps_cache
 end
 
